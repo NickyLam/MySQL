@@ -158,8 +158,8 @@ mysql> UNLOCk TABLES;
 
 
 如表所示，当使用单线程slave时，一下配置是在意外中止后最容易恢复的：    
-- 当使用GTID和[MASTER_AUTO_POSITION]()时，把[relay_log_recovery]()设成1。有了这个配置，[relay_log_info_repository]()和其他变量的设置就不会影响到恢复了。
-- 当时用到给予复制的文件位置时，把[relay_log_recovery]()设成1，[relay_log_info_repository]()设成[TABLE]()。  
+- 当使用GTID和[MASTER_AUTO_POSITION]()时，设[relay_log_recovery=1]()。有了这个配置，[relay_log_info_repository]()和其他变量的设置就不会影响到恢复了。
+- 当时用到给予复制的文件位置时，设[relay_log_recovery=1]()，[relay_log_info_repository=TABLE]()。  
 
 > **注意**        
 > 在恢复过程中，中继日志是缺失的。
@@ -181,9 +181,54 @@ mysql> UNLOCk TABLES;
 
 
 如表所示，当使用多线程slave时，一下配置是在意外中止后最容易恢复的：    
-- 当使用GTID和[MASTER_AUTO_POSITION]()时，把[relay_log_recovery]()设成1。有了这个配置，[relay_log_info_repository]()和其他变量的设置就不会影响到恢复了。
-- 当时用到给予复制的文件位置时，把[relay_log_recovery]()设成1，[sync_relay_log]()设成1，[relay_log_info_repository]()设成[TABLE]()。  
+- 当使用GTID和[MASTER_AUTO_POSITION]()时，设[relay_log_recovery=1]()。有了这个配置，[relay_log_info_repository]()和其他变量的设置就不会影响到恢复了。
+- 当时用到给予复制的文件位置时，设[relay_log_recovery=1]()设，[sync_relay_log=1]()，[relay_log_info_repository=TABLE]()。  
 
 > **注意**        
 > 在恢复过程中，中继日志是缺失的。
+
+值得注意的是[sync_relay_log=1]()的影响很大，因为它在每次事务中都会对中继日志进行写入。尽管这个方法在意外中止时最容易恢复，最多导致一个未写的事务丢失，但是它还是有可能会大大提升存储的负载。如果没有设置[sync_relay_log=1]()，那么意外中止的影响取决于操作系统如何处理中继日志。同时要注意当[relay_log_recovery=0]()时，在下次slave从意外中止后启动时，中继日志会处理为恢复的一部分。在这个过程完成后，中继日志会被删除。         
+
+如果一个多线程复制slave采用了上述复制配置中推荐的文件位置，它意外中止后可能会导致中继日志的事务不一致（事务序列的间隔）。参考[Replication and Transaction Inconsistencies]()。在MySQL 5.7.13及以后的版本中，如果中继日志恢复过程中出现这样的事务不一致，它们会被填充，并且恢复过程自动继续。在MySQL 5.7.13以前的版本中，这个过程并不会自动进行，要求设置[relay_log_recovery=0]()来启动服务器，用[START SLAVE UNTIL SQL_AFTER_MTS_GAPS]()来启动slave，从而修补事务部一致性，再设置[relay_log_recovery=1]()来重启slave。      
+
+当你是用多源复制，并且设置[relay_log_recovery=1]()时，由于意外中止的缘故，在重启后，所有复制通道将会进行中继日志恢复过程。任何由多线程slave的意外中止导致的中继日志中的不一致性将会被修复。            
+
+### 用不同的master和slave存储引擎进行复制    
+对于复制过程来说，master的源表和slave上的复制表是否适用不同的引擎类型并不重要。实际上，[default_storage_engine]()和[storage_engine]()两个系统变量并不会被复制。     
+
+这提供了复制过程的一系列好处，你可以在不同的复制场景利用不同的引起类型的优势。例如，在一个典型的向外扩展的场景（参考[第 17.3.4 节 用复制向外扩展]()），你想在master上用[InnoDB]()表来有利于事务的函数化，但是在slave上使用[MyISAM]()，因为数据是只读的，所以不需要事务支持。当你在数据日志记录环境中，你可能想在slave上用[Archive]()引擎。         
+
+如何在master和slave上配置不同的引擎取决于你如何初始化复制过程：   
+- 如果你是用[mysqldump]()在master上创建数据库快照，那么你可以编辑复制文件文本来修改用在每张表上的引擎类型。<br />  另一个[mysqldump]()的选择就是在用复制文件在slave创建数据前把不想使用的引擎类型关闭。例如，你可以在你的slave上通过添加[--skip-federated]()选项来把[FEDERATED]()引擎关闭掉。如果用于创建一个表的某种特定引擎类型不存在，那么MySQL会采用默认引擎类型，通常是[MyISAM]()（这要求关闭[NO_ENGINE_SUBSTITUION]()模式）。如果你想用这种方法关闭额外的引擎，那么你可以考虑在slave上创建特殊的二进制文件来只支持你想用的引擎类型。      
+- 如果你用原始数据文件（二进制备份）来创建slave，那么你不能够改变出事的表格式。相反，你可以在slave启动后，用[ALTER TABLE]()来改变表类型。  
+- 当master恰好没有表时想创建新的master/slave复制，在创建新表时避免指定特定引擎类型。        
+
+
+如果你已经在运行一个复制过程，并且想把你已有的表格转换成另一种引擎类型，遵循以下步骤： 
+1. 从运行中的复制更新过程中关闭slave：
+```SQL
+mysql> STOP SLAVE;
+```
+这会让你在改变引擎类型时不受干扰。
+
+2. 对每张表执行[ALTER TABLE ... ENGINE='engine_type']()来改变。   
+3. 重启slave复制过程：
+```SQL
+mysql> START SLAVE;
+```
+
+尽管[default_storage_engine]()变量不会被复制，但要注意，包括指定引擎类型的[CREATE TABLE]()和[ALTER TABLE]()变量会被正确地复制到slave上。例如，如果你有一个CSV表，并且你执行：
+```SQL
+mysql> ALTER TABLE csvtable Engine='MyISAM';
+```
+上述声明会被复制到slave上，并且slave的引起类型会被改成[MyISAM]()，即使你没有事先在slave上把表类型改成CSV意外的其他类型。如果你想要保持master和slave的引擎不同，那么你在master上要小心使用[default_storage_engine]()变量来创建新表。例如，代替：
+```SQL
+mysql> CREATE TABLE tablea (columna int) Engine=MyISAM;
+```
+你可以用：
+```SQL
+mysql> SET default_storage_engine=MyISAM;
+mysql> CREATE TABLE tablea (columna int);
+```
+当复制完，[default_storage_engine]()变量会被忽略，slave会用默认引擎来执行[CREATE TABLE]()声明。             
 
